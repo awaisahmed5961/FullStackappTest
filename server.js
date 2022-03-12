@@ -1,9 +1,15 @@
 const express = require('express');
 const app = express();
 const bodyparser = require('body-parser');
-const axios = require('axios');
-
+const puppeteer = require('puppeteer-extra');
 const cors = require('cors')
+
+const StealthPlugin = require('puppeteer-extra-plugin-stealth')
+puppeteer.use(StealthPlugin())
+
+const AdblockerPlugin = require('puppeteer-extra-plugin-adblocker');
+const { val } = require('cheerio/lib/api/attributes');
+puppeteer.use(AdblockerPlugin({ blockTrackers: true }))
 
 app.set('port', (process.env.PORT || 2400));
 
@@ -11,7 +17,13 @@ app.use(bodyparser.json());
 app.use(bodyparser.urlencoded({ extended: true }));
 app.use(cors())
 
-
+app.use((error, req, res, next) => {
+    res.status(error.status || 500).json({
+        error: {
+            message: "Internal Server Error"
+        }
+    })
+})
 
 app.get('/api/v1/balance', (req, res) => {
     res.json({
@@ -23,53 +35,20 @@ app.get('/api/v1/balance', (req, res) => {
 })
 
 app.get('/api/v1/bank/:iban', async (req, res) => {
-    try {
-        const ibanDetail = await ScrapIBANData(req.params.iban);
-        if (ibanDetail.data && ibanDetail.data.data.bank.bank_name == "") {
-            res.json({
-                "code": 404,
-                "error": {
-                    "status": "Bad Request",
-                    "message": "Bank doesn’t exist"
-                }
-            }).stauts(404)
-        }
-
-        res.json({
-            "code": 203,
-            "data": {
-                "bank": ibanDetail.data.data.bank.bank_name,
-                "logo": null,
-                "country_code": ibanDetail.data.data.country_code
-            }
-        }).stauts(203)
-    } catch (error) {
-        if (error.stauts == 400) {
-            res.json({
-                "code": 400,
-                "error": {
-                    "message": "Invalid IBAN Number"
-                }
-            }).stauts(400)
-        }
-        res.json({
-            "code": 400,
-            "error": {
-                "message": "Invalid IBAN Number"
-            }
-        })
+    const result = await ValidateIBAN(req.params.iban)
+    if (result.code == 203) {
+        res.send(result)
+    }
+    if (result.code == 400) {
+        res.sendStatus(400).send(result)
     }
 })
 app.post('/api/v1/transfer/:iban', async (req, res) => {
     const { amount, currency } = req.body;
+    const result = await ValidateIBAN(req.params.iban)
+    if (result.code == 203) {
 
-    try {
-        const ibanDetail = await ScrapIBANData(req.params.iban);
-        const { data } = ibanDetail
-        console.log(amount)
-        console.log(currency)
-        console.log(process.env.BALANCE)
-        if (process.env.BALANCE > amount) {
+        if (process.env.BALANCE < amount) {
             res.json({
                 "code": 402,
                 "error": {
@@ -79,7 +58,7 @@ app.post('/api/v1/transfer/:iban', async (req, res) => {
             })
         }
 
-        if (currency != data.data.currency_code) {
+        if (currency != 'AED') {
             res.json({
                 "code": 409,
                 "error": {
@@ -89,55 +68,59 @@ app.post('/api/v1/transfer/:iban', async (req, res) => {
             })
         }
 
-
-        if (data.result == 200 && currency == data.data.currency_code && amount < process.env.BALANCE) {
-            process.env.BALANCE = (process.env.BALANCE - amount);
-            res.send(process.env.BALANCE)
-        }
-    } catch (error) {
-        if (error.status == 400) {
-            res.json({
-                "error": {
-                    "code": 400,
-                    "message": "Invalid IBAN Number"
-                }
-            }).stauts(400)
-        }
-
-        res.json({
-            "error": {
-                "code": 400,
-                "message": "Invalid IBAN Number"
-            }
-        }).stauts(400)
+        process.env.BALANCE = (process.env.BALANCE - amount);
+        res.send(process.env.BALANCE)
 
     }
-
-
-
-
+    if (result.code == 400) {
+        res.sendStatus(400).send(result)
+    }
 })
 
 
 
-const ScrapIBANData = (Iban) => {
-    var FormData = require('form-data');
-    var data = new FormData();
-    data.append('iban', Iban);
-    data.append('api_key', '1acd3fd6fe22992b67677d48c79350984a410c94');
-    var config = {
-        method: 'post',
-        url: 'https://api.ibanapi.com/v1/validate',
-        headers: {
-            ...data.getHeaders()
-        },
-        data: data
-    };
 
-    return axios(config)
+async function ValidateIBAN(IBAN) {
 
+    const browser = await puppeteer.launch();
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/61.0.3163.100 Safari/537.36');
+
+    await page.goto('https://wise.com/sg/iban/checker');
+    await page.type('input[id=iban-number]', IBAN);
+
+    await page.evaluate(() => {
+        const a = document.querySelector('button[type=submit]').click();
+    });
+    await page.waitForNavigation();
+    const [getError] = await page.$x('//*[@id="main"]/section[1]/div/div/div/form/div/div');
+    if (getError) {
+        const error = await page.evaluate(name => name.innerText, getError);
+        return {
+            "code": 400,
+            "error": {
+                "status": "Bad Request",
+                "message": error
+            }
+        }
+    }
+    else {
+        const [getAccountNumber] = await page.$x('//*[@id="main"]/section[1]/div/div/div[1]/div[2]/h3');
+        const accountNumber = await page.evaluate(name => name.innerText, getAccountNumber);
+        const [getBankName] = await page.$x('//*[@id="main"]/section[1]/div/div/div[1]/div[2]/p[2]');
+        const bankName = await page.evaluate(name => name.innerText, getBankName);
+        const [getBankLogo] = await page.$x('//*[@id="main"]/section[1]/div/div/div[1]/div[2]/img');
+        const bankLogo = await page.evaluate(name => name.src, getBankLogo);
+
+        return {
+            "code": 203,
+            "data": {
+                "bank": bankName,
+                "logo": bankLogo
+            }
+        }
+    }
 }
-
 app.listen(app.get('port'), () => {
     console.log("server started on port " + app.get('port'))
 })
